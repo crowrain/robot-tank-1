@@ -133,6 +133,7 @@
       <div class="btnrow" style="justify-content:center">
         <button class="ghost" data-cmd="SCAN">Скан</button>
         <button class="ghost" data-cmd="IR">ИК</button>
+        <button class="ghost" id="repairBtn">🔁 Связь</button>
         <button class="ghost" id="resetMapBtn">Сброс карты</button>
       </div>
     </div>
@@ -234,6 +235,8 @@ taskBtn.addEventListener('click', () => {
 agentStopBtn.addEventListener('click', () => wsSend({type:'agent_stop'}));
 document.getElementById('resetMapBtn').addEventListener('click', () =>
   wsSend({type:'map_reset'}));
+document.getElementById('repairBtn').addEventListener('click', () =>
+  wsSend({type:'repair'}));
 
 // ---- карта ----
 const canvas = document.getElementById('map');

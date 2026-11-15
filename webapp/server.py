@@ -138,6 +138,75 @@ def bt_connect_linux() -> bool:
         return False
     return True
 
+def bt_repair_linux() -> bool:
+    """Полное переспаривание HC-06 на Linux: remove → scan → pair → trust.
+    Лечит «застывший» канал клона HC-06, когда соединение поднимается,
+    но данные не идут."""
+    log("sys", "Переспаривание: удаляю старую запись BlueZ…")
+    subprocess.run(["bluetoothctl", "remove", BT_ADDR], capture_output=True)
+    time.sleep(2)
+    try:
+        proc = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                text=True)
+        def send(cmd, wait):
+            proc.stdin.write(cmd + "\n")
+            proc.stdin.flush()
+            time.sleep(wait)
+        send("power on", 1)
+        send("agent KeyboardDisplay", 1)
+        send("default-agent", 1)
+        log("sys", "Переспаривание: сканирование эфира (12 с)…")
+        send("scan on", 12)
+        send("scan off", 1)
+        send(f"pair {BT_ADDR}", 4)
+        send(BT_PIN, 5)          # ответ на запрос PIN
+        send(BT_PIN, 2)          # дубль на случай позднего запроса
+        send(f"trust {BT_ADDR}", 2)
+        send("quit", 1)
+        proc.wait(timeout=10)
+    except Exception as e:
+        log("sys", f"Переспаривание: ошибка диалога bluetoothctl: {e}")
+        return False
+    r = subprocess.run(["bluetoothctl", "info", BT_ADDR],
+                       capture_output=True, text=True)
+    if "Paired: yes" in r.stdout:
+        log("sys", "Переспаривание: HC-06 спарен и trusted")
+        return True
+    log("sys", "Переспаривание: НЕ удалось (устройство не найдено в эфире?)")
+    return False
+
+def repair_link(source: str = "авто") -> bool:
+    """Переспаривание + переподключение. Вызывать при подозрении на
+    застывший канал. На macOS переспаривание уже встроено в bt_connect."""
+    global ser
+    if MOCK:
+        log("sys", "MOCK-режим: переспаривание не нужно")
+        return True
+    log("sys", f"Ремонт связи ({source})…")
+    with tank_lock:
+        try:
+            if ser is not None:
+                ser.close()
+        except Exception:
+            pass
+        ser = None
+        if not IS_MAC:
+            if not bt_repair_linux():
+                set_link("fail")
+                return False
+            log("sys", "Переспаривание: пауза перед подключением…")
+            time.sleep(5)
+        try:
+            tank_open()
+        except Exception as e:
+            log("sys", f"Ремонт связи: подключение не удалось: {e}")
+            set_link("fail")
+            return False
+    set_link("ok")
+    log("sys", "Связь восстановлена")
+    return True
+
 def bt_connect():
     """Переспаривание HC-06 и подключение (обход глюка клонов на macOS)."""
     def bt(*args):
@@ -264,7 +333,13 @@ def tank_cmd(command: str, source: str = "manual") -> str:
     """Потокобезопасная команда с логом и картой."""
     with tank_lock:
         log("tx", command)
-        resp = tank_raw(command)
+        if ser is None and not MOCK:
+            resp = "(нет связи с танком)"
+        else:
+            try:
+                resp = tank_raw(command)
+            except Exception as e:
+                resp = f"(ошибка связи: {e})"
         log("rx", resp or "(молчит)")
     update_pose(command, resp)
     if command == "SCAN":
@@ -351,6 +426,9 @@ async def ws_endpoint(ws: WebSocket):
                     agent_thread.start()
             elif kind == "agent_stop":
                 agent_stop.set()
+            elif kind == "repair":                  # ручное переспаривание
+                threading.Thread(target=repair_link, args=("ручной запуск",),
+                                 daemon=True).start()
             elif kind == "map_reset":
                 pose.update(x=0.0, y=0.0, heading=0.0)
                 obstacles.clear()
@@ -381,12 +459,22 @@ def set_link(state: str):
         broadcast({"type": "link", "state": state})
 
 def heartbeat_loop():
-    """Каждые HEARTBEAT_S секунд проверяет связь PING-ом;
-    при обрыве закрывает порт и переподключается к танку."""
+    """Каждые HEARTBEAT_S секунд проверяет связь PING-ом.
+    Обрыв → реконнект; реконнект не вышел → полное переспаривание."""
     global ser
     while True:
         time.sleep(HEARTBEAT_S)
-        if MOCK or ser is None:
+        if MOCK:
+            continue
+        if ser is None:
+            # связи нет (старт не удался или обрыв): пробуем восстановить
+            try:
+                with tank_lock:
+                    tank_open()
+                set_link("ok")
+                log("sys", "Связь восстановлена")
+            except Exception:
+                repair_link("авто")
             continue
         try:
             with tank_lock:
@@ -397,19 +485,13 @@ def heartbeat_loop():
                 raise ConnectionError(f"PING → {resp!r}")
             set_link("ok")
         except Exception as e:
-            log("sys", f"Связь с танком потеряна ({e}), переподключение…")
+            log("sys", f"Связь с танком потеряна ({e})")
             set_link("fail")
             try:
                 ser.close()
             except Exception:
                 pass
             ser = None
-            try:
-                tank_open()
-                set_link("ok")
-                log("sys", "Связь восстановлена")
-            except Exception as e2:
-                log("sys", f"Переподключение не удалось: {e2}")
 
 if __name__ == "__main__":
     port = 7100
