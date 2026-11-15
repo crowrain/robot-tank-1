@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Пульт LLM-танка</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2f3a;
+    --text: #e6e8ee; --dim: #8b93a5; --accent: #4f9cff;
+    --green: #3ddc84; --red: #ff5c5c; --yellow: #ffc857;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "SF Pro Text", "Segoe UI", sans-serif;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--yellow); }
+  .dot.ok { background: var(--green); }
+  .dot.fail { background: var(--red); }
+  .dot.pulse { animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  #linkLabel { color: var(--dim); font-size: 13px; }
+  main {
+    flex: 1; display: grid; gap: 10px; padding: 10px;
+    grid-template-columns: 300px 1fr 340px;
+    grid-template-rows: 1fr auto; min-height: 0;
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 12px; display: flex; flex-direction: column; min-height: 0;
+  }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin-bottom: 10px; }
+
+  /* --- задание --- */
+  #taskPanel { grid-column: 1; grid-row: 1; }
+  #taskInput {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); padding: 10px; font-size: 14px;
+    resize: none; height: 90px; font-family: inherit;
+  }
+  #taskInput:focus { outline: none; border-color: var(--accent); }
+  .btnrow { display: flex; gap: 8px; margin-top: 10px; }
+  button {
+    background: var(--accent); border: none; color: #fff; border-radius: 8px;
+    padding: 10px 14px; font-size: 14px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { filter: brightness(1.15); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.danger { background: var(--red); }
+  button.ghost { background: var(--border); }
+  #agentState { font-size: 12px; color: var(--dim); margin-top: 8px; }
+
+  /* --- ручное управление --- */
+  #manualPanel { margin-top: 14px; }
+  .pad {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+    max-width: 240px; margin: 0 auto;
+  }
+  .pad button {
+    padding: 16px 0; font-size: 20px; background: var(--border);
+  }
+  .pad button:active { background: var(--accent); }
+  .pad .stop { background: var(--red); font-size: 15px; font-weight: 700; }
+  .pad .empty { visibility: hidden; }
+
+  /* --- карта --- */
+  #mapPanel { grid-column: 2; grid-row: 1 / 3; }
+  #map { flex: 1; width: 100%; min-height: 0; border-radius: 8px; background: var(--bg); }
+  .mapbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .mapbar span { font-size: 12px; color: var(--dim); }
+
+  /* --- лог --- */
+  #logPanel { grid-column: 3; grid-row: 1 / 3; }
+  #log {
+    flex: 1; overflow-y: auto; font-family: "SF Mono", Menlo, monospace;
+    font-size: 12px; line-height: 1.6;
+  }
+  #log .line { padding: 2px 6px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
+  #log .ts { color: var(--dim); margin-right: 6px; }
+  #log .tx  { color: var(--accent); }
+  #log .rx  { color: var(--green); }
+  #log .llm { color: var(--yellow); background: rgba(255,200,87,.07); }
+  #log .sys { color: var(--dim); font-style: italic; }
+
+  @media (max-width: 1000px) {
+    main { grid-template-columns: 1fr; grid-template-rows: auto 400px 300px; overflow-y: auto; }
+    #taskPanel, #mapPanel, #logPanel { grid-column: 1; grid-row: auto; }
+    body { overflow: auto; height: auto; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 Пульт LLM-танка</h1>
+  <div class="dot" id="linkDot"></div>
+  <span id="linkLabel">подключение…</span>
+  <span style="flex:1"></span>
+  <span class="dot" id="agentDot" style="display:none"></span>
+  <span id="agentLabel" style="color:var(--dim);font-size:13px"></span>
+</header>
+
+<main>
+  <!-- Задание + ручное управление -->
+  <div class="panel" id="taskPanel">
+    <h2>Задание роботу</h2>
+    <textarea id="taskInput" placeholder="Например: проезжай вперёд, огибая препятствия…"></textarea>
+    <div class="btnrow">
+      <button id="taskBtn">▶ Выполнить</button>
+      <button id="agentStopBtn" class="danger" disabled>■ Стоп агент</button>
+    </div>
+    <div id="agentState"></div>
+
+    <div class="panel" id="manualPanel" style="padding:0;border:none;background:none">
+      <h2>Ручное управление</h2>
+      <div class="pad">
+        <span class="empty"></span>
+        <button data-cmd="FWD 500">▲</button>
+        <span class="empty"></span>
+        <button data-cmd="LEFT 300">◀</button>
+        <button class="stop" data-cmd="STOP">STOP</button>
+        <button data-cmd="RIGHT 300">▶</button>
+        <span class="empty"></span>
+        <button data-cmd="BACK 500">▼</button>
+        <span class="empty"></span>
+      </div>
+      <div class="btnrow" style="justify-content:center">
+        <button class="ghost" data-cmd="SCAN">Скан</button>
+        <button class="ghost" data-cmd="IR">ИК</button>
+        <button class="ghost" id="resetMapBtn">Сброс карты</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Путевая карта -->
+  <div class="panel" id="mapPanel">
+    <div class="mapbar">
+      <h2 style="margin:0">Путевая карта</h2>
+      <span id="poseLabel">x: 0 см, y: 0 см, курс 0°</span>
+    </div>
+    <canvas id="map"></canvas>
+  </div>
+
+  <!-- Лог -->
+  <div class="panel" id="logPanel">
+    <h2>Обмен данными</h2>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>
+const ws = new WebSocket(`ws://${location.host}/ws`);
+const logEl = document.getElementById('log');
+const linkDot = document.getElementById('linkDot');
+const linkLabel = document.getElementById('linkLabel');
+const agentDot = document.getElementById('agentDot');
+const agentLabel = document.getElementById('agentLabel');
+const taskBtn = document.getElementById('taskBtn');
+const agentStopBtn = document.getElementById('agentStopBtn');
+const poseLabel = document.getElementById('poseLabel');
+
+let mapState = { pose: {x:0,y:0,heading:0}, trail: [], obstacles: [] };
+
+ws.onopen = () => { linkDot.className = 'dot pulse'; linkLabel.textContent = 'WebSocket подключён, жду танк…'; };
+
+ws.onmessage = (ev) => {
+  const e = JSON.parse(ev.data);
+  if (e.type === 'log') addLog(e);
+  else if (e.type === 'map') { mapState = e; drawMap(); }
+  else if (e.type === 'link') {
+    linkDot.className = 'dot ' + (e.state === 'ok' ? 'ok' : 'fail');
+    linkLabel.textContent = e.state === 'ok' ? 'танк на связи' : 'танк не подключён';
+  }
+  else if (e.type === 'agent') {
+    const running = e.state === 'running';
+    agentDot.style.display = running ? '' : 'none';
+    agentDot.className = 'dot ok pulse';
+    agentLabel.textContent = running ? 'агент работает' : '';
+    taskBtn.disabled = running;
+    agentStopBtn.disabled = !running;
+    document.getElementById('agentState').textContent = running ? 'LLM выполняет задание…' : '';
+  }
+};
+
+function addLog(e) {
+  const div = document.createElement('div');
+  div.className = 'line ' + e.dir;
+  const arrow = {tx: '→ танк', rx: '← танк', llm: '🧠 LLM', sys: '⚙'}[e.dir] || '';
+  div.innerHTML = `<span class="ts">${e.ts}</span>${arrow}: ${escapeHtml(e.text)}`;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function escapeHtml(s) {
+  return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+// ---- ручное управление ----
+document.querySelectorAll('[data-cmd]').forEach(btn => {
+  btn.addEventListener('click', () => ws.send(JSON.stringify({type:'cmd', cmd: btn.dataset.cmd})));
+});
+// клавиатура: стрелки/WASD
+document.addEventListener('keydown', (ev) => {
+  if (ev.target.tagName === 'TEXTAREA') return;
+  const map = {ArrowUp:'FWD 500', KeyW:'FWD 500', ArrowDown:'BACK 500', KeyS:'BACK 500',
+               ArrowLeft:'LEFT 300', KeyA:'LEFT 300', ArrowRight:'RIGHT 300', KeyD:'RIGHT 300',
+               Space:'STOP'};
+  const cmd = map[ev.code];
+  if (cmd) { ev.preventDefault(); ws.send(JSON.stringify({type:'cmd', cmd})); }
+});
+
+// ---- задание LLM ----
+taskBtn.addEventListener('click', () => {
+  const text = document.getElementById('taskInput').value.trim();
+  if (text) ws.send(JSON.stringify({type:'task', text}));
+});
+agentStopBtn.addEventListener('click', () => ws.send(JSON.stringify({type:'agent_stop'})));
+document.getElementById('resetMapBtn').addEventListener('click', () =>
+  ws.send(JSON.stringify({type:'map_reset'})));
+
+// ---- карта ----
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
+const SCALE = 0.5;            // px на см
+const VIEW = {x: 0, y: 0};    // центр вида в см (следим за роботом)
+
+function drawMap() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w*dpr) { canvas.width = w*dpr; canvas.height = h*dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#0f1115';
+  ctx.fillRect(0, 0, w, h);
+
+  // камера следует за роботом
+  VIEW.x = mapState.pose.x; VIEW.y = mapState.pose.y;
+  const toPx = (x, y) => [w/2 + (x - VIEW.x)*SCALE, h/2 - (y - VIEW.y)*SCALE];
+
+  // сетка 50 см
+  ctx.strokeStyle = '#1c2029'; ctx.lineWidth = 1;
+  const step = 50 * SCALE;
+  const offX = (w/2 - VIEW.x*SCALE) % step, offY = (h/2 + VIEW.y*SCALE) % step;
+  ctx.beginPath();
+  for (let x = offX; x < w; x += step) { ctx.moveTo(x, 0); ctx.lineTo(x, h); }
+  for (let y = offY; y < h; y += step) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
+  ctx.stroke();
+
+  // препятствия
+  ctx.fillStyle = '#ff5c5c';
+  for (const [ox, oy] of mapState.obstacles) {
+    const [px, py] = toPx(ox, oy);
+    ctx.beginPath(); ctx.arc(px, py, 2.5, 0, 7); ctx.fill();
+  }
+
+  // путь
+  if (mapState.trail.length > 1) {
+    ctx.strokeStyle = '#4f9cff'; ctx.lineWidth = 2; ctx.beginPath();
+    mapState.trail.forEach(([x, y], i) => {
+      const [px, py] = toPx(x, y);
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.stroke();
+  }
+
+  // робот
+  const [rx, ry] = toPx(mapState.pose.x, mapState.pose.y);
+  const a = mapState.pose.heading * Math.PI/180;
+  ctx.save();
+  ctx.translate(rx, ry); ctx.rotate(a);
+  ctx.fillStyle = '#3ddc84';
+  ctx.beginPath();
+  ctx.moveTo(0, -10); ctx.lineTo(7, 8); ctx.lineTo(-7, 8); ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  poseLabel.textContent = `x: ${mapState.pose.x.toFixed(0)} см, y: ${mapState.pose.y.toFixed(0)} см, курс ${((mapState.pose.heading%360)+360)%360|0}°`;
+}
+new ResizeObserver(drawMap).observe(canvas);
+drawMap();
+</script>
+</body>
+</html>
