@@ -45,6 +45,12 @@ SPEED_CM_S = 30.0          # скорость вперёд, см/с
 TURN_DEG_PER_MS = 0.12     # градусов поворота за мс (300 мс ≈ 36°)
 SCAN_OFFSETS = (-70, -30, 0, 30, 70)   # углы лучей сканера относительно курса
 
+# Вольтметр АКБ (делитель 1:1 на A0). Включается переменной TANK_BATT=1.
+# Пороги для 2×18650 по умолчанию: 8.4 В полный, 6.0 В пустой.
+BATT_ENABLED = os.environ.get("TANK_BATT", "0") == "1"
+BATT_FULL_MV = int(os.environ.get("TANK_BATT_FULL", "8400"))
+BATT_EMPTY_MV = int(os.environ.get("TANK_BATT_EMPTY", "6000"))
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 CAL_FILE = os.path.join(BASE, "calibration.json")   # калибровка, переживает перезагрузку танка
 
@@ -310,6 +316,8 @@ def mock_response(command: str) -> str:
         return "IR:0,0"
     if op == "STATUS":
         return "SPEED:168/255 CENTER:107 MAXDUR:3000"
+    if op == "BATT":
+        return "BATT:7400"
     return "OK"
 
 def update_pose(command: str, response: str):
@@ -373,6 +381,17 @@ def tank_cmd(command: str, source: str = "manual") -> str:
     return resp
 
 # ---------------- LLM-агент ----------------
+
+def batt_query():
+    """BATT → {"type":"batt","mv":..., "pct":...} или None при ошибке."""
+    resp = tank_cmd("BATT", source="ui")
+    m = re.search(r"BATT:(\d+)", resp or "")
+    if not m:
+        return None
+    mv = int(m.group(1))
+    pct = max(0, min(100, round((mv - BATT_EMPTY_MV) * 100
+                                / (BATT_FULL_MV - BATT_EMPTY_MV))))
+    return {"type": "batt", "mv": mv, "pct": pct}
 
 def cal_query() -> dict:
     """Текущая калибровка из танка (STATUS)."""
@@ -462,7 +481,7 @@ async def ws_endpoint(ws: WebSocket):
             kind = data.get("type")
             if kind == "cmd":                       # ручное управление
                 cmd = data.get("cmd", "")
-                allowed = {"FWD", "BACK", "LEFT", "RIGHT", "STOP", "SCAN", "IR"}
+                allowed = {"FWD", "BACK", "LEFT", "RIGHT", "STOP", "SCAN", "IR", "BATT"}
                 if cmd.split()[0] in allowed:
                     threading.Thread(target=tank_cmd, args=(cmd,), daemon=True).start()
             elif kind == "task":                    # задание для LLM
@@ -479,6 +498,17 @@ async def ws_endpoint(ws: WebSocket):
             elif kind == "repair":                  # ручное переспаривание
                 threading.Thread(target=repair_link, args=("ручной запуск",),
                                  daemon=True).start()
+            elif kind == "get_batt":                # напряжение АКБ
+                def _batt():
+                    if not BATT_ENABLED:
+                        log("sys", "Вольтметр выключен (TANK_BATT=1 на сервере)")
+                        return
+                    ev = batt_query()
+                    if ev:
+                        broadcast(ev)
+                    else:
+                        log("sys", "Батарея: нет ответа (прошивка старая?)")
+                threading.Thread(target=_batt, daemon=True).start()
             elif kind == "get_cal":                 # прочитать калибровку из танка
                 threading.Thread(
                     target=lambda: broadcast({"type": "cal", **cal_query()}),
@@ -546,6 +576,10 @@ def heartbeat_loop():
             if resp != "PONG":
                 raise ConnectionError(f"PING → {resp!r}")
             set_link("ok")
+            if BATT_ENABLED:
+                ev = batt_query()
+                if ev:
+                    broadcast(ev)
         except Exception as e:
             log("sys", f"Связь с танком потеряна ({e})")
             set_link("fail")

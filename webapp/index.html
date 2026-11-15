@@ -107,6 +107,7 @@
   <h1>🤖 Пульт LLM-танка</h1>
   <div class="dot" id="linkDot"></div>
   <span id="linkLabel">подключение…</span>
+  <span id="battLabel" style="font-size:13px;color:var(--dim);display:none"></span>
   <span style="flex:1"></span>
   <span class="dot" id="agentDot" style="display:none"></span>
   <span id="agentLabel" style="color:var(--dim);font-size:13px"></span>
@@ -207,6 +208,13 @@ function connect() {
       if (e.state === 'ok') wsSend({type:'get_cal'});
     }
     else if (e.type === 'cal') setCalUI(e);
+    else if (e.type === 'batt') {
+      const el = document.getElementById('battLabel');
+      el.style.display = '';
+      const v = (e.mv / 1000).toFixed(1);
+      el.textContent = `🔋 ${e.pct}% (${v} В)`;
+      el.style.color = e.pct > 50 ? 'var(--green)' : e.pct > 20 ? 'var(--yellow)' : 'var(--red)';
+    }
     else if (e.type === 'agent') {
       const running = e.state === 'running';
       agentDot.style.display = running ? '' : 'none';

@@ -31,6 +31,7 @@ const uint8_t PIN_ECHO  = 13;  // ультразвук: эхо
 const uint8_t PIN_SERVO = 10;  // серво с датчиком
 const uint8_t PIN_IR_L  = A2;  // левый ИК-датчик (LOW = препятствие); замерено 15.11.2026
 const uint8_t PIN_IR_R  = A1;  // правый ИК-датчик — на плате A1/A2 перепутаны
+const uint8_t PIN_BATT  = A0;  // вольтметр: делитель 1:1 (10k+10k) с АКБ+ на A0
 
 // ---------- Калибровка ----------
 // У дешёвых моторов разбег большой: подберите PWM так, чтобы танк ехал прямо.
@@ -131,6 +132,14 @@ void handle(String cmd) {
 
   if (op == "PING") {
     Serial.println("PONG");
+  } else if (op == "BATT") {
+    // BATT -> BATT:<мВ> — напряжение АКБ через делитель 1:1 на A0.
+    // 8 выборок для сглаживания; Vref = 5.0 В, делитель x2.
+    unsigned long acc = 0;
+    for (uint8_t i = 0; i < 8; i++) { acc += analogRead(PIN_BATT); delay(2); }
+    unsigned long mv = (acc / 8) * 5000UL / 1023UL * 2UL;
+    Serial.print("BATT:");
+    Serial.println(mv);
   } else if (op == "FWD") {
     if (driveFor(forward, arg, true)) Serial.println("STOPPED_IR");
     else Serial.println("OK");
