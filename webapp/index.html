@@ -155,7 +155,7 @@
 </main>
 
 <script>
-const ws = new WebSocket(`ws://${location.host}/ws`);
+let ws = null;
 const logEl = document.getElementById('log');
 const linkDot = document.getElementById('linkDot');
 const linkLabel = document.getElementById('linkLabel');
@@ -167,26 +167,38 @@ const poseLabel = document.getElementById('poseLabel');
 
 let mapState = { pose: {x:0,y:0,heading:0}, trail: [], obstacles: [] };
 
-ws.onopen = () => { linkDot.className = 'dot pulse'; linkLabel.textContent = 'WebSocket подключён, жду танк…'; };
+function wsSend(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
 
-ws.onmessage = (ev) => {
-  const e = JSON.parse(ev.data);
-  if (e.type === 'log') addLog(e);
-  else if (e.type === 'map') { mapState = e; drawMap(); }
-  else if (e.type === 'link') {
-    linkDot.className = 'dot ' + (e.state === 'ok' ? 'ok' : 'fail');
-    linkLabel.textContent = e.state === 'ok' ? 'танк на связи' : 'танк не подключён';
-  }
-  else if (e.type === 'agent') {
-    const running = e.state === 'running';
-    agentDot.style.display = running ? '' : 'none';
-    agentDot.className = 'dot ok pulse';
-    agentLabel.textContent = running ? 'агент работает' : '';
-    taskBtn.disabled = running;
-    agentStopBtn.disabled = !running;
-    document.getElementById('agentState').textContent = running ? 'LLM выполняет задание…' : '';
-  }
-};
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { linkDot.className = 'dot pulse'; linkLabel.textContent = 'WebSocket подключён, жду танк…'; };
+  ws.onclose = () => {
+    linkDot.className = 'dot fail';
+    linkLabel.textContent = 'сервер недоступен, переподключение…';
+    setTimeout(connect, 3000);
+  };
+  ws.onmessage = (ev) => {
+    const e = JSON.parse(ev.data);
+    if (e.type === 'log') addLog(e);
+    else if (e.type === 'map') { mapState = e; drawMap(); }
+    else if (e.type === 'link') {
+      linkDot.className = 'dot ' + (e.state === 'ok' ? 'ok' : 'fail');
+      linkLabel.textContent = e.state === 'ok' ? 'танк на связи' : 'танк не подключён';
+    }
+    else if (e.type === 'agent') {
+      const running = e.state === 'running';
+      agentDot.style.display = running ? '' : 'none';
+      agentDot.className = 'dot ok pulse';
+      agentLabel.textContent = running ? 'агент работает' : '';
+      taskBtn.disabled = running;
+      agentStopBtn.disabled = !running;
+      document.getElementById('agentState').textContent = running ? 'LLM выполняет задание…' : '';
+    }
+  };
+}
+connect();
 
 function addLog(e) {
   const div = document.createElement('div');
@@ -202,7 +214,7 @@ function escapeHtml(s) {
 
 // ---- ручное управление ----
 document.querySelectorAll('[data-cmd]').forEach(btn => {
-  btn.addEventListener('click', () => ws.send(JSON.stringify({type:'cmd', cmd: btn.dataset.cmd})));
+  btn.addEventListener('click', () => wsSend({type:'cmd', cmd: btn.dataset.cmd}));
 });
 // клавиатура: стрелки/WASD
 document.addEventListener('keydown', (ev) => {
@@ -211,17 +223,17 @@ document.addEventListener('keydown', (ev) => {
                ArrowLeft:'LEFT 300', KeyA:'LEFT 300', ArrowRight:'RIGHT 300', KeyD:'RIGHT 300',
                Space:'STOP'};
   const cmd = map[ev.code];
-  if (cmd) { ev.preventDefault(); ws.send(JSON.stringify({type:'cmd', cmd})); }
+  if (cmd) { ev.preventDefault(); wsSend({type:'cmd', cmd}); }
 });
 
 // ---- задание LLM ----
 taskBtn.addEventListener('click', () => {
   const text = document.getElementById('taskInput').value.trim();
-  if (text) ws.send(JSON.stringify({type:'task', text}));
+  if (text) wsSend({type:'task', text});
 });
-agentStopBtn.addEventListener('click', () => ws.send(JSON.stringify({type:'agent_stop'})));
+agentStopBtn.addEventListener('click', () => wsSend({type:'agent_stop'}));
 document.getElementById('resetMapBtn').addEventListener('click', () =>
-  ws.send(JSON.stringify({type:'map_reset'})));
+  wsSend({type:'map_reset'}));
 
 // ---- карта ----
 const canvas = document.getElementById('map');

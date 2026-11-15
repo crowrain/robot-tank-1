@@ -54,9 +54,11 @@ trail = []                                     # [(x, y), ...] путь
 clients = set()
 loop = None
 ser = None
+link_state = None          # None / "ok" / "fail" — чтобы не слать дубли
 tank_lock = threading.Lock()
 agent_thread = None
 agent_stop = threading.Event()
+HEARTBEAT_S = 20           # период проверки связи PING
 
 # ---------------- Рассылка ----------------
 
@@ -326,6 +328,9 @@ async def ws_endpoint(ws: WebSocket):
     await ws.send_text(json.dumps(
         {"type": "map", "kind": "full", "pose": pose, "trail": trail,
          "obstacles": obstacles}, ensure_ascii=False))
+    if link_state:
+        await ws.send_text(json.dumps(
+            {"type": "link", "state": link_state}, ensure_ascii=False))
     try:
         while True:
             data = json.loads(await ws.receive_text())
@@ -359,14 +364,52 @@ async def startup():
     global loop
     loop = asyncio.get_running_loop()
     threading.Thread(target=_connect_thread, daemon=True).start()
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
 
 def _connect_thread():
     try:
         tank_open()
-        broadcast({"type": "link", "state": "ok"})
+        set_link("ok")
     except Exception as e:
         log("sys", f"Не удалось подключиться к танку: {e}")
-        broadcast({"type": "link", "state": "fail"})
+        set_link("fail")
+
+def set_link(state: str):
+    global link_state
+    if state != link_state:
+        link_state = state
+        broadcast({"type": "link", "state": state})
+
+def heartbeat_loop():
+    """Каждые HEARTBEAT_S секунд проверяет связь PING-ом;
+    при обрыве закрывает порт и переподключается к танку."""
+    global ser
+    while True:
+        time.sleep(HEARTBEAT_S)
+        if MOCK or ser is None:
+            continue
+        try:
+            with tank_lock:
+                ser.reset_input_buffer()
+                ser.write(b"PING\n")
+                resp = ser.readline().decode(errors="replace").strip()
+            if resp != "PONG":
+                raise ConnectionError(f"PING → {resp!r}")
+            set_link("ok")
+        except Exception as e:
+            log("sys", f"Связь с танком потеряна ({e}), переподключение…")
+            set_link("fail")
+            try:
+                ser.close()
+            except Exception:
+                pass
+            ser = None
+            try:
+                tank_open()
+                set_link("ok")
+                log("sys", "Связь восстановлена")
+            except Exception as e2:
+                log("sys", f"Переподключение не удалось: {e2}")
 
 if __name__ == "__main__":
     port = 7100
