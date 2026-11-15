@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 venv/
+
+webapp/settings.json
+webapp/settings.json.tmp

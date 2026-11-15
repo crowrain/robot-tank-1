@@ -10,6 +10,7 @@ Mock-режим без железа: TANK_MOCK=1 python3 server.py
 """
 
 import asyncio
+from collections import deque
 import json
 import math
 import os
@@ -39,6 +40,8 @@ BT_PIN = bridge.BT_PIN
 SERIAL_PORT = bridge.SERIAL_PORT
 BAUD = bridge.BAUD
 MOCK = os.environ.get("TANK_MOCK") == "1"
+# Поддерживается только адаптер BCM20702A0, для которого настроен sudoers.
+USB_RESET_COMMAND = ["sudo", "-n", "/usr/bin/usbreset", "0b05:17cb"]
 
 # Калибровка одометрии (приблизительно, dead reckoning без энкодеров!)
 SPEED_CM_S = 30.0          # скорость вперёд, см/с
@@ -52,6 +55,7 @@ BATT_FULL_MV = int(os.environ.get("TANK_BATT_FULL", "8400"))
 BATT_EMPTY_MV = int(os.environ.get("TANK_BATT_EMPTY", "6000"))
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(BASE, "settings.json")
 CAL_FILE = os.path.join(BASE, "calibration.json")   # калибровка, переживает перезагрузку танка
 
 def cal_load() -> dict:
@@ -74,13 +78,53 @@ pose = {"x": 0.0, "y": 0.0, "heading": 0.0}   # см, градусы; 0 = «се
 obstacles = []                                 # [(x, y), ...] из сканов
 trail = []                                     # [(x, y), ...] путь
 clients = set()
+log_history = deque(maxlen=300)
+log_lock = threading.Lock()
+repair_lock = threading.Lock()
 loop = None
 ser = None
 link_state = None          # None / "ok" / "fail" — чтобы не слать дубли
 tank_lock = threading.Lock()
 agent_thread = None
 agent_stop = threading.Event()
-HEARTBEAT_S = 20           # период проверки связи PING
+DEFAULT_HEARTBEAT_S = 60
+HEARTBEAT_MIN_S = 10
+HEARTBEAT_MAX_S = 3600
+heartbeat_changed = threading.Event()
+settings_lock = threading.Lock()
+
+def load_heartbeat_interval():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            value = json.load(f).get("heartbeat_s", DEFAULT_HEARTBEAT_S)
+        if type(value) is int and HEARTBEAT_MIN_S <= value <= HEARTBEAT_MAX_S:
+            return value
+    except (OSError, ValueError, AttributeError):
+        pass
+    return DEFAULT_HEARTBEAT_S
+
+heartbeat_interval = load_heartbeat_interval()
+
+def set_heartbeat_interval(value):
+    global heartbeat_interval
+    if type(value) is not int or not HEARTBEAT_MIN_S <= value <= HEARTBEAT_MAX_S:
+        raise ValueError(f"Укажите целое число от {HEARTBEAT_MIN_S} до {HEARTBEAT_MAX_S} секунд")
+    with settings_lock:
+        temp_path = SETTINGS_FILE + ".tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump({"heartbeat_s": value}, f)
+            os.replace(temp_path, SETTINGS_FILE)
+        except OSError:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+        heartbeat_interval = value
+        heartbeat_changed.set()
+    log("sys", f"Интервал проверки связи: {value} с")
+    broadcast({"type": "settings", "heartbeat_s": value})
 
 # ---------------- Рассылка ----------------
 
@@ -100,8 +144,12 @@ async def _broadcast_async(event: dict):
         clients.discard(ws)
 
 def log(direction: str, text: str):
-    broadcast({"type": "log", "dir": direction, "text": text,
-               "ts": time.strftime("%H:%M:%S")})
+    event = {"type": "log", "dir": direction, "text": text,
+             "ts": time.strftime("%H:%M:%S")}
+    with log_lock:
+        log_history.append(event)
+        print(f"[{event['ts']}] {direction}: {text}", flush=True)
+        broadcast(event)
 
 def map_event(kind: str):
     broadcast({"type": "map", "kind": kind, "pose": dict(pose),
@@ -117,7 +165,11 @@ class RFCOMMLink:
         self.sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM,
                                   socket.BTPROTO_RFCOMM)
         self.sock.settimeout(timeout)
-        self.sock.connect((mac, channel))
+        try:
+            self.sock.connect((mac, channel))
+        except Exception:
+            self.sock.close()
+            raise
         self.buf = b""
 
     def reset_input_buffer(self):
@@ -149,58 +201,82 @@ class RFCOMMLink:
         except OSError:
             pass
 
-def bt_connect_linux() -> bool:
-    """На Linux устройство уже спарено (bluetoothctl pair/trust) —
-    просто проверяем, что BlueZ его знает."""
+def bt_info_linux() -> str:
     r = subprocess.run(["bluetoothctl", "info", BT_ADDR],
-                       capture_output=True, text=True)
-    if "Paired: yes" not in r.stdout:
-        log("sys", "HC-06 не спарен на этом хосте! "
-                   "Выполните: bluetoothctl pair " + BT_ADDR)
-        return False
-    return True
+                       capture_output=True, text=True, timeout=10)
+    output = (r.stdout + r.stderr).strip()
+    log("sys", f"bluetoothctl info: код {r.returncode}; {output or '(нет вывода)'}")
+    return r.stdout
+
+
+def bt_connect_linux() -> bool:
+    return "Paired: yes" in bt_info_linux()
+
 
 def bt_repair_linux() -> bool:
-    """Полное переспаривание HC-06 на Linux: remove → scan → pair → trust.
-    Лечит «застывший» канал клона HC-06, когда соединение поднимается,
-    но данные не идут."""
-    log("sys", "Переспаривание: удаляю старую запись BlueZ…")
-    subprocess.run(["bluetoothctl", "remove", BT_ADDR], capture_output=True)
-    time.sleep(2)
+    """Ручное переспаривание; вывод bluetoothctl сохраняется без PIN."""
+    log("sys", "Переспаривание: состояние перед удалением:")
     try:
+        bt_info_linux()
+        r = subprocess.run(["bluetoothctl", "remove", BT_ADDR],
+                           capture_output=True, text=True, timeout=10)
+        log("sys", f"bluetoothctl remove: код {r.returncode}; {(r.stdout + r.stderr).strip() or '(нет вывода)'}")
         proc = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                text=True)
-        def send(cmd, wait):
-            proc.stdin.write(cmd + "\n")
-            proc.stdin.flush()
-            time.sleep(wait)
-        send("power on", 1)
-        send("agent KeyboardDisplay", 1)
-        send("default-agent", 1)
-        log("sys", "Переспаривание: сканирование эфира (12 с)…")
-        send("scan on", 12)
-        send("scan off", 1)
-        send(f"pair {BT_ADDR}", 4)
-        send(BT_PIN, 5)          # ответ на запрос PIN
-        send(BT_PIN, 2)          # дубль на случай позднего запроса
-        send(f"trust {BT_ADDR}", 2)
-        send("quit", 1)
-        proc.wait(timeout=10)
-    except Exception as e:
-        log("sys", f"Переспаривание: ошибка диалога bluetoothctl: {e}")
-        return False
-    r = subprocess.run(["bluetoothctl", "info", BT_ADDR],
-                       capture_output=True, text=True)
-    if "Paired: yes" in r.stdout:
-        log("sys", "Переспаривание: HC-06 спарен и trusted")
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        def read_output():
+            for line in proc.stdout:
+                # PIN может быть повторён программой или терминалом.
+                line = line.strip()
+                if line:
+                    log("sys", "bluetoothctl: " + line.replace(BT_PIN, "[PIN скрыт]"))
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        try:
+            def send(cmd, wait, label=None):
+                log("sys", f"bluetoothctl → {label or cmd}")
+                proc.stdin.write(cmd + "\n")
+                proc.stdin.flush()
+                time.sleep(wait)
+            send("power on", 1)
+            send("agent KeyboardDisplay", 1)
+            send("default-agent", 1)
+            send("scan on", 12)
+            send("scan off", 1)
+            send(f"pair {BT_ADDR}", 4)
+            send(BT_PIN, 5, "[PIN скрыт]")
+            send(BT_PIN, 2, "[PIN скрыт, повтор]")
+            send(f"trust {BT_ADDR}", 2)
+            send("quit", 1)
+            proc.wait(timeout=10)
+            reader.join(timeout=2)
+            log("sys", f"bluetoothctl завершён: код {proc.returncode}")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        info = bt_info_linux()
+        if "Paired: yes" not in info or "Trusted: yes" not in info:
+            log("sys", "Переспаривание не подтверждено BlueZ; проверьте вывод выше")
+            return False
         return True
-    log("sys", "Переспаривание: НЕ удалось (устройство не найдено в эфире?)")
-    return False
+    except Exception as e:
+        log("sys", f"Переспаривание: {type(e).__name__}: {e}")
+        return False
 
-def repair_link(source: str = "авто") -> bool:
+def repair_link(source: str = "ручной запуск") -> bool:
     """Переспаривание + переподключение. Вызывать при подозрении на
     застывший канал. На macOS переспаривание уже встроено в bt_connect."""
+    if not repair_lock.acquire(blocking=False):
+        log("sys", "Ручное подключение уже выполняется")
+        return False
+    try:
+        return _repair_link(source)
+    finally:
+        repair_lock.release()
+
+
+def _repair_link(source: str) -> bool:
     global ser
     if MOCK:
         log("sys", "MOCK-режим: переспаривание не нужно")
@@ -222,12 +298,71 @@ def repair_link(source: str = "авто") -> bool:
         try:
             tank_open()
         except Exception as e:
-            log("sys", f"Ремонт связи: подключение не удалось: {e}")
+            if ser is not None:
+                ser.close()
+                ser = None
+            log("sys", f"Ремонт связи: подключение не удалось: {type(e).__name__}: {e}")
             set_link("fail")
             return False
     set_link("ok")
     log("sys", "Связь восстановлена")
     return True
+
+def reset_usb_adapter():
+    """Ручной сброс USB-адаптера; связь восстанавливается отдельно."""
+    global ser
+    if not repair_lock.acquire(blocking=False):
+        log("sys", "Операция с Bluetooth уже выполняется")
+        return False
+    try:
+        if MOCK:
+            log("sys", "MOCK-режим: сброс USB не выполняется")
+            return True
+        if IS_MAC:
+            log("sys", "Сброс USB-адаптера поддерживается только на Linux")
+            return False
+        agent_stop.set()
+        log("sys", "USB Bluetooth: остановка агента и закрытие соединения с танком")
+        with tank_lock:
+            if ser is not None:
+                try:
+                    # Команда выполняется после окончания предыдущей операции.
+                    log("tx", "STOP")
+                    log("rx", tank_raw("STOP") or "(нет ответа)")
+                except Exception as e:
+                    log("sys", f"USB Bluetooth: STOP не подтверждён: {type(e).__name__}: {e}")
+                finally:
+                    ser.close()
+                    ser = None
+            set_link("fail")
+            try:
+                log("sys", "USB Bluetooth: сброс адаптера BCM20702A0 (0b05:17cb)")
+                result = subprocess.run(USB_RESET_COMMAND, capture_output=True,
+                                        text=True, timeout=20)
+                output = (result.stdout + result.stderr).strip()
+                log("sys", f"usbreset: код {result.returncode}; {output or '(нет вывода)'}")
+                # Некоторые версии usbreset возвращают 0 даже при ошибке open/ioctl.
+                if result.returncode != 0 or not re.search(r"\bok\s*$", output):
+                    raise RuntimeError("USB-сброс не подтверждён; проверьте права и вывод usbreset")
+                # После USB reset контроллер может несколько секунд отсутствовать в BlueZ.
+                for attempt in range(10):
+                    result = subprocess.run(["bluetoothctl", "power", "on"],
+                                            capture_output=True, text=True, timeout=10)
+                    output = (result.stdout + result.stderr).strip()
+                    log("sys", f"bluetoothctl power on (попытка {attempt + 1}): код {result.returncode}; {output or '(нет вывода)'}")
+                    if result.returncode == 0 and "succeeded" in output.lower():
+                        break
+                    if attempt < 9:
+                        time.sleep(2)
+                else:
+                    raise RuntimeError("не удалось включить адаптер после сброса")
+                log("sys", "USB Bluetooth: адаптер сброшен. Нажмите «Связь» для подключения танка")
+                return True
+            except Exception as e:
+                log("sys", f"USB Bluetooth: ошибка: {type(e).__name__}: {e}")
+                return False
+    finally:
+        repair_lock.release()
 
 def bt_connect():
     """Переспаривание HC-06 и подключение (обход глюка клонов на macOS)."""
@@ -276,15 +411,18 @@ def tank_open():
                 break
             except OSError as e:
                 last_err = e
-                time.sleep(3)
+                log("sys", f"RFCOMM: ошибка попытки {attempt + 1}: {type(e).__name__}: {e}")
+                if attempt < 5:
+                    time.sleep(3)
         else:
             raise ConnectionError(f"RFCOMM не поднялся: {last_err}")
     time.sleep(2)
-    ser.reset_input_buffer()
-    greeting = ser.readline().decode(errors="replace").strip()
-    log("sys", f"Порт открыт. Приветствие: {greeting or '(нет)'}")
+    log("sys", "Порт открыт, проверяю ответ танка")
     log("tx", "PING")
-    log("rx", tank_raw("PING", quiet=True))
+    response = tank_raw("PING", quiet=True)
+    log("rx", response or "(нет ответа)")
+    if response != "PONG":
+        raise ConnectionError(f"PING: ожидался PONG, получено {response!r}")
     # применяем сохранённую калибровку (TRIM/CENTER в танке живут до перезагрузки)
     cal = cal_load()
     if cal:
@@ -340,8 +478,8 @@ def update_pose(command: str, response: str):
     elif op == "RIGHT" and response == "OK":
         pose["heading"] += TURN_DEG_PER_MS * ms
         map_event("move")
-    elif op in ("FWD",) and response == "STOPPED_IR":
-        # препятствие перед собой: ставим метку в ~10 см по курсу
+    elif op == "FWD" and response in ("STOPPED_IR", "STOPPED_SONAR"):
+        # Остановленное движение прошло неизвестное расстояние; позиция приблизительна.
         ox = pose["x"] + 10 * math.sin(math.radians(pose["heading"]))
         oy = pose["y"] + 10 * math.cos(math.radians(pose["heading"]))
         obstacles.append((round(ox, 1), round(oy, 1)))
@@ -365,7 +503,9 @@ def record_scan(resp: str):
 
 def tank_cmd(command: str, source: str = "manual") -> str:
     """Потокобезопасная команда с логом и картой."""
+    global ser
     with tank_lock:
+        log("sys", f"Команда от {source}")
         log("tx", command)
         if ser is None and not MOCK:
             resp = "(нет связи с танком)"
@@ -373,7 +513,12 @@ def tank_cmd(command: str, source: str = "manual") -> str:
             try:
                 resp = tank_raw(command)
             except Exception as e:
-                resp = f"(ошибка связи: {e})"
+                resp = f"(ошибка связи: {type(e).__name__}: {e})"
+                if ser is not None:
+                    ser.close()
+                    ser = None
+                set_link("fail")
+                log("sys", "Связь потеряна; для повторного подключения нажмите «Связь»")
         log("rx", resp or "(молчит)")
     update_pose(command, resp)
     if command == "SCAN":
@@ -469,9 +614,14 @@ async def index():
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     clients.add(ws)
+    with log_lock:
+        history = list(log_history)
+    for event in history:
+        await ws.send_text(json.dumps(event, ensure_ascii=False))
     await ws.send_text(json.dumps(
         {"type": "map", "kind": "full", "pose": pose, "trail": trail,
          "obstacles": obstacles}, ensure_ascii=False))
+    await ws.send_text(json.dumps({"type": "settings", "heartbeat_s": heartbeat_interval}))
     if link_state:
         await ws.send_text(json.dumps(
             {"type": "link", "state": link_state}, ensure_ascii=False))
@@ -498,6 +648,13 @@ async def ws_endpoint(ws: WebSocket):
             elif kind == "repair":                  # ручное переспаривание
                 threading.Thread(target=repair_link, args=("ручной запуск",),
                                  daemon=True).start()
+            elif kind == "reset_bluetooth_usb":
+                threading.Thread(target=reset_usb_adapter, daemon=True).start()
+            elif kind == "set_settings":
+                try:
+                    set_heartbeat_interval(data.get("heartbeat_s"))
+                except (ValueError, OSError) as e:
+                    await ws.send_text(json.dumps({"type": "settings_error", "text": str(e)}, ensure_ascii=False))
             elif kind == "get_batt":                # напряжение АКБ
                 def _batt():
                     if not BATT_ENABLED:
@@ -533,16 +690,9 @@ async def ws_endpoint(ws: WebSocket):
 async def startup():
     global loop
     loop = asyncio.get_running_loop()
-    threading.Thread(target=_connect_thread, daemon=True).start()
+    set_link("ok" if MOCK else "fail")
+    log("sys", "MOCK-режим" if MOCK else "Автоподключение отключено. Нажмите «Связь» для ручного подключения.")
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-
-def _connect_thread():
-    try:
-        tank_open()
-        set_link("ok")
-    except Exception as e:
-        log("sys", f"Не удалось подключиться к танку: {e}")
-        set_link("fail")
 
 def set_link(state: str):
     global link_state
@@ -551,43 +701,33 @@ def set_link(state: str):
         broadcast({"type": "link", "state": state})
 
 def heartbeat_loop():
-    """Каждые HEARTBEAT_S секунд проверяет связь PING-ом.
-    Обрыв → реконнект; реконнект не вышел → полное переспаривание."""
+    """Проверка существующего соединения без автоматического восстановления."""
     global ser
     while True:
-        time.sleep(HEARTBEAT_S)
+        if heartbeat_changed.wait(heartbeat_interval):
+            heartbeat_changed.clear()
+            continue
         if MOCK:
             continue
-        if ser is None:
-            # связи нет (старт не удался или обрыв): пробуем восстановить
+        with tank_lock:
+            if ser is None:
+                continue
             try:
-                with tank_lock:
-                    tank_open()
-                set_link("ok")
-                log("sys", "Связь восстановлена")
-            except Exception:
-                repair_link("авто")
-            continue
-        try:
-            with tank_lock:
-                ser.reset_input_buffer()
-                ser.write(b"PING\n")
-                resp = ser.readline().decode(errors="replace").strip()
-            if resp != "PONG":
-                raise ConnectionError(f"PING → {resp!r}")
-            set_link("ok")
-            if BATT_ENABLED:
-                ev = batt_query()
-                if ev:
-                    broadcast(ev)
-        except Exception as e:
-            log("sys", f"Связь с танком потеряна ({e})")
-            set_link("fail")
-            try:
+                log("tx", "PING (heartbeat)")
+                resp = tank_raw("PING")
+                log("rx", resp or "(нет ответа)")
+                if resp != "PONG":
+                    raise ConnectionError(f"PING → {resp!r}")
+            except Exception as e:
+                log("sys", f"Связь потеряна: {type(e).__name__}: {e}. Нажмите «Связь» для подключения.")
                 ser.close()
-            except Exception:
-                pass
-            ser = None
+                ser = None
+                set_link("fail")
+                continue
+        if BATT_ENABLED:
+            ev = batt_query()
+            if ev:
+                broadcast(ev)
 
 if __name__ == "__main__":
     port = 7100
