@@ -224,11 +224,20 @@ def bt_repair_linux() -> bool:
         proc = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)
+        discovered = threading.Event()
+        pin_requested = threading.Event()
+        paired = threading.Event()
         def read_output():
             for line in proc.stdout:
                 # PIN может быть повторён программой или терминалом.
-                line = line.strip()
+                line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip()
                 if line:
+                    if BT_ADDR.upper() in line.upper() and ("[NEW]" in line or "[CHG]" in line):
+                        discovered.set()
+                    if "Request PIN code" in line:
+                        pin_requested.set()
+                    if "Pairing successful" in line or (BT_ADDR.upper() in line.upper() and "Paired: yes" in line):
+                        paired.set()
                     log("sys", "bluetoothctl: " + line.replace(BT_PIN, "[PIN скрыт]"))
         reader = threading.Thread(target=read_output, daemon=True)
         reader.start()
@@ -241,12 +250,31 @@ def bt_repair_linux() -> bool:
             send("power on", 1)
             send("agent KeyboardDisplay", 1)
             send("default-agent", 1)
-            send("scan on", 12)
-            send("scan off", 1)
-            send(f"pair {BT_ADDR}", 4)
-            send(BT_PIN, 5, "[PIN скрыт]")
-            send(BT_PIN, 2, "[PIN скрыт, повтор]")
+            send("scan bredr", 0)
+            log("sys", "Поиск HC-06: ожидаю обнаружения до 60 с")
+            if not discovered.wait(60):
+                log("sys", "HC-06 не обнаружен за 60 с; сопряжение не запускалось")
+                send("scan off", 1)
+                send("quit", 0)
+                proc.wait(timeout=10)
+                reader.join(timeout=2)
+                return False
+            log("sys", "HC-06 обнаружен; начинаю сопряжение")
+            send(f"pair {BT_ADDR}", 0)
+            deadline = time.monotonic() + 20
+            while not paired.is_set() and not pin_requested.is_set() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if pin_requested.is_set() and not paired.is_set():
+                send(BT_PIN, 0, "[PIN скрыт]")
+            if not paired.wait(20):
+                log("sys", "Нет подтверждения сопряжения от BlueZ")
+                send("scan off", 1)
+                send("quit", 0)
+                proc.wait(timeout=10)
+                reader.join(timeout=2)
+                return False
             send(f"trust {BT_ADDR}", 2)
+            send("scan off", 1)
             send("quit", 1)
             proc.wait(timeout=10)
             reader.join(timeout=2)
