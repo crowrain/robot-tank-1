@@ -14,6 +14,7 @@ import json
 import math
 import os
 import platform
+import re
 import socket
 import subprocess
 import sys
@@ -45,6 +46,21 @@ TURN_DEG_PER_MS = 0.12     # градусов поворота за мс (300 м
 SCAN_OFFSETS = (-70, -30, 0, 30, 70)   # углы лучей сканера относительно курса
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+CAL_FILE = os.path.join(BASE, "calibration.json")   # калибровка, переживает перезагрузку танка
+
+def cal_load() -> dict:
+    try:
+        with open(CAL_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def cal_save(cal: dict):
+    try:
+        with open(CAL_FILE, "w", encoding="utf-8") as f:
+            json.dump(cal, f)
+    except Exception as e:
+        log("sys", f"Не удалось сохранить калибровку: {e}")
 
 # ---------------- Состояние ----------------
 
@@ -263,6 +279,16 @@ def tank_open():
     log("sys", f"Порт открыт. Приветствие: {greeting or '(нет)'}")
     log("tx", "PING")
     log("rx", tank_raw("PING", quiet=True))
+    # применяем сохранённую калибровку (TRIM/CENTER в танке живут до перезагрузки)
+    cal = cal_load()
+    if cal:
+        l, r = int(cal.get("speedL", 168)), int(cal.get("speedR", 255))
+        c = int(cal.get("center", 107))
+        log("tx", f"TRIM {l} {r}")
+        log("rx", tank_raw(f"TRIM {l} {r}", quiet=True))
+        log("tx", f"CENTER {c}")
+        log("rx", tank_raw(f"CENTER {c}", quiet=True))
+        log("sys", f"Калибровка применена: моторы {l}/{r}, голова {c}°")
 
 def tank_raw(command: str, quiet: bool = False) -> str:
     """Низкоуровневая отправка. Вызывать под tank_lock."""
@@ -348,6 +374,30 @@ def tank_cmd(command: str, source: str = "manual") -> str:
 
 # ---------------- LLM-агент ----------------
 
+def cal_query() -> dict:
+    """Текущая калибровка из танка (STATUS)."""
+    resp = tank_cmd("STATUS", source="ui")
+    cal = {"l": 168, "r": 255, "center": 107}
+    m = re.search(r"SPEED:(\d+)/(\d+)", resp)
+    if m:
+        cal["l"], cal["r"] = int(m.group(1)), int(m.group(2))
+    m = re.search(r"CENTER:(\d+)", resp)
+    if m:
+        cal["center"] = int(m.group(1))
+    return cal
+
+def cal_apply(l: int, r: int, center: int):
+    """Применить калибровку к танку и сохранить на сервере."""
+    ok1 = tank_cmd(f"TRIM {l} {r}", source="ui")
+    ok2 = tank_cmd(f"CENTER {center}", source="ui")
+    if ok1 == "OK" and ok2 == "OK":
+        cal_save({"speedL": l, "speedR": r, "center": center})
+        log("sys", f"Калибровка сохранена: моторы {l}/{r}, голова {center}°")
+    else:
+        log("sys", "Калибровка НЕ применена (танк не подтвердил)")
+
+# ---------------- LLM-агент ----------------
+
 class WebTank:
     """Адаптер под интерфейс bridge.Tank, но через tank_cmd с картой и логом."""
     def cmd(self, command: str) -> str:
@@ -429,6 +479,18 @@ async def ws_endpoint(ws: WebSocket):
             elif kind == "repair":                  # ручное переспаривание
                 threading.Thread(target=repair_link, args=("ручной запуск",),
                                  daemon=True).start()
+            elif kind == "get_cal":                 # прочитать калибровку из танка
+                threading.Thread(
+                    target=lambda: broadcast({"type": "cal", **cal_query()}),
+                    daemon=True).start()
+            elif kind == "set_cal":                 # применить и сохранить
+                l = max(0, min(255, int(data.get("l", 168))))
+                r = max(0, min(255, int(data.get("r", 255))))
+                c = max(5, min(175, int(data.get("center", 107))))
+                def _apply():
+                    cal_apply(l, r, c)
+                    broadcast({"type": "cal", "l": l, "r": r, "center": c})
+                threading.Thread(target=_apply, daemon=True).start()
             elif kind == "map_reset":
                 pose.update(x=0.0, y=0.0, heading=0.0)
                 obstacles.clear()

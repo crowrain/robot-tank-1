@@ -70,6 +70,12 @@
   .pad .stop { background: var(--red); font-size: 15px; font-weight: 700; }
   .pad .empty { visibility: hidden; }
 
+  /* --- калибровка --- */
+  .calrow { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+  .calrow span { width: 54px; color: var(--dim); }
+  .calrow input[type=range] { flex: 1; accent-color: var(--accent); }
+  .calrow b { width: 40px; text-align: right; font-weight: 600; }
+
   /* --- карта --- */
   #mapPanel { grid-column: 2; grid-row: 1 / 3; }
   #map { flex: 1; width: 100%; min-height: 0; border-radius: 8px; background: var(--bg); }
@@ -136,6 +142,17 @@
         <button class="ghost" id="repairBtn">🔁 Связь</button>
         <button class="ghost" id="resetMapBtn">Сброс карты</button>
       </div>
+
+      <div class="panel" id="calPanel" style="padding:0;border:none;background:none;margin-top:14px">
+        <h2>Калибровка</h2>
+        <div class="calrow"><span>Левый</span><input type="range" id="calL" min="120" max="255" value="168"><b id="calLv">168</b></div>
+        <div class="calrow"><span>Правый</span><input type="range" id="calR" min="120" max="255" value="255"><b id="calRv">255</b></div>
+        <div class="calrow"><span>Голова</span><input type="range" id="calC" min="5" max="175" value="107"><b id="calCv">107°</b></div>
+        <div class="btnrow" style="justify-content:center">
+          <button id="calApplyBtn">Применить</button>
+          <button class="ghost" id="calTestBtn">Тест: вперёд 1 с</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -187,7 +204,9 @@ function connect() {
     else if (e.type === 'link') {
       linkDot.className = 'dot ' + (e.state === 'ok' ? 'ok' : 'fail');
       linkLabel.textContent = e.state === 'ok' ? 'танк на связи' : 'танк не подключён';
+      if (e.state === 'ok') wsSend({type:'get_cal'});
     }
+    else if (e.type === 'cal') setCalUI(e);
     else if (e.type === 'agent') {
       const running = e.state === 'running';
       agentDot.style.display = running ? '' : 'none';
@@ -237,6 +256,28 @@ document.getElementById('resetMapBtn').addEventListener('click', () =>
   wsSend({type:'map_reset'}));
 document.getElementById('repairBtn').addEventListener('click', () =>
   wsSend({type:'repair'}));
+
+// ---- калибровка ----
+['calL','calR','calC'].forEach(id => {
+  const el = document.getElementById(id);
+  el.addEventListener('input', () => {
+    document.getElementById(id + 'v').textContent = el.value + (id === 'calC' ? '°' : '');
+  });
+});
+document.getElementById('calApplyBtn').addEventListener('click', () =>
+  wsSend({type:'set_cal', l:+document.getElementById('calL').value,
+          r:+document.getElementById('calR').value,
+          center:+document.getElementById('calC').value}));
+document.getElementById('calTestBtn').addEventListener('click', () =>
+  wsSend({type:'cmd', cmd:'FWD 1000'}));
+function setCalUI(c) {
+  document.getElementById('calL').value = c.l;
+  document.getElementById('calLv').textContent = c.l;
+  document.getElementById('calR').value = c.r;
+  document.getElementById('calRv').textContent = c.r;
+  document.getElementById('calC').value = c.center;
+  document.getElementById('calCv').textContent = c.center + '°';
+}
 
 // ---- карта ----
 const canvas = document.getElementById('map');
