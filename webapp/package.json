@@ -1,0 +1,9 @@
+{
+  "name": "llm-tank-webapp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Веб-пульт LLM-танка (бэкенд на Python/FastAPI)",
+  "scripts": {
+    "dev": "python3 server.py --port 7100"
+  }
+}
